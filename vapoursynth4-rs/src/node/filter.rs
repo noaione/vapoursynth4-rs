@@ -27,12 +27,44 @@ where
     /// The type of the value this filter returns, in the syntax
     /// `registerFunction` takes, such as `clip:vnode` for a video node.
     ///
-    /// A `gpu` modifier on a returned clip, as in `clip:vnode:gpu`, is what
-    /// makes the filter a GPU filter: the framework reads it and creates the
-    /// node with [`ffi::VSFilterFlags::GPUOutput`], which is the flag the core
-    /// requires the declaration to agree with. Stating it once, here, is what
-    /// keeps a GPU filter from saying one thing and creating the other.
+    /// The residency modifier on a returned clip is what makes the filter a GPU
+    /// filter, and it is also what the framework hands to the core:
+    ///
+    /// - `clip:vnode:gpu` produces GPU resident frames, and the node is created
+    ///   with [`ffi::VSFilterFlags::GPUOutput`].
+    /// - `clip:vnode` produces host resident frames, and the flag stays clear.
+    /// - `clip:vnode:all` produces either, decided per instance by
+    ///   [`gpu_output()`](Self::gpu_output).
+    ///
+    /// Stating it once, here, is what keeps a filter from saying one thing and
+    /// creating the other: for the first two the declaration *is* the flag, and
+    /// for `all` the flag is the instance's answer, which the core then holds
+    /// every frame it delivers to.
     const RETURN_TYPE: &'static CStr;
+
+    /// Whether this instance produces GPU resident frames.
+    ///
+    /// The default is the declaration, which is what keeps `clip:vnode:gpu` and
+    /// [`ffi::VSFilterFlags::GPUOutput`] from ever disagreeing. A
+    /// `clip:vnode:all` return has no answer of its own, so a filter that
+    /// declares one has to say what this instance makes; saying nothing is a
+    /// panic rather than a guess, because a wrong flag is a frame the core
+    /// refuses far from the mistake.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the filter declares `clip:vnode:all` and does not override
+    /// this.
+    fn gpu_output(&self) -> bool {
+        match declared_residency(Self::RETURN_TYPE.to_bytes()) {
+            Residency::Gpu => true,
+            Residency::Cpu => false,
+            Residency::All => panic!(
+                "{}: a `clip:vnode:all` return has to state its output residency per instance",
+                Self::NAME.to_string_lossy()
+            ),
+        }
+    }
 
     /// # Errors
     ///
@@ -90,36 +122,66 @@ impl<F: Filter> FilterRegister<F> {
     }
 }
 
-/// Whether a declared return type asks for GPU resident frames.
+/// What a declared return type says about the frames a filter produces.
 ///
 /// The syntax is `name:type[:modifier]*`, separated by `;` between returned
 /// values, so the modifiers are everything after the first two parts of an
 /// entry.
-#[cfg(feature = "vs-43")]
-fn declares_gpu(return_type: &[u8]) -> bool {
-    return_type
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Residency {
+    /// `clip:vnode;` — host resident, and the flag must not be set.
+    Cpu,
+    /// `clip:vnode:gpu;` — GPU resident, and the flag must be set.
+    Gpu,
+    /// `clip:vnode:all;` — either, decided per instance.
+    All,
+}
+
+/// The residency a declared return type asks for.
+///
+/// Several returned values share one filter and therefore one flag, so a `gpu`
+/// entry decides for all of them; `all` only applies when nothing demands GPU
+/// output, because a `gpu` declaration is the stricter of the two.
+fn declared_residency(return_type: &[u8]) -> Residency {
+    let modifiers = return_type
         .split(|byte| *byte == b';')
         .filter(|entry| !entry.is_empty())
-        .any(|entry| {
+        .flat_map(|entry| {
             let mut parts = entry.split(|byte| *byte == b':');
             parts.next();
             parts.next();
-            parts.any(|part| part == b"gpu")
-        })
+            parts
+        });
+    let mut has_all = false;
+    for modifier in modifiers {
+        match modifier {
+            b"gpu" => return Residency::Gpu,
+            b"all" => has_all = true,
+            _ => {}
+        }
+    }
+    if has_all {
+        Residency::All
+    } else {
+        Residency::Cpu
+    }
 }
 
 /// The [`ffi::VSFilterFlags`] a filter has to be created with.
 ///
 /// `VapourSynth` takes the requirement from the declared return type and then
 /// refuses a node created without the matching flag, so the two have to agree.
-/// Reading the same declaration here means a filter states it in one place and
-/// cannot get the pair wrong.
+/// For a `gpu` or absent modifier the declaration settles it on its own; for
+/// `all` it is [`Filter::gpu_output()`] that answers, and asking that instance
+/// here is what makes the flag it is created with the one it said it would
+/// deliver.
+///
 /// The result is the flags argument of the entry point that takes one, which
 /// `vs-43` and up do. A filter with no flags is exactly what the older entry
 /// point creates, so the two paths differ only in whether the argument exists.
 #[cfg(feature = "vs-43")]
-pub(crate) fn filter_flags<F: Filter>() -> i32 {
-    if declares_gpu(F::RETURN_TYPE.to_bytes()) {
+pub(crate) fn filter_flags<F: Filter>(filter: &F) -> i32 {
+    if filter.gpu_output() {
         ffi::VSFilterFlags::GPUOutput as i32
     } else {
         0
@@ -129,24 +191,101 @@ pub(crate) fn filter_flags<F: Filter>() -> i32 {
 pub type ActivationReason = ffi::VSActivationReason;
 
 #[cfg(test)]
-#[cfg(feature = "vs-43")]
 mod tests {
-    use super::declares_gpu;
+    use std::ffi::{CStr, c_void};
+
+    use super::{Filter, Residency, declared_residency};
+    use crate::{
+        core::CoreRef,
+        ffi,
+        frame::{FrameContext, VideoFrame},
+        map::MapRef,
+    };
+
+    fn residency(return_type: &str) -> Residency {
+        declared_residency(return_type.as_bytes())
+    }
 
     #[test]
-    fn gpu_modifier_is_read_from_the_type() {
-        assert!(declares_gpu(b"clip:vnode:gpu;"));
-        assert!(declares_gpu(b"clip:vnode:gpu"));
-        assert!(declares_gpu(b"clip:vnode:gpu:whatever;alpha:vnode;"));
-        assert!(declares_gpu(b"alpha:vnode;clip:vnode:gpu;"));
+    fn a_residency_modifier_is_read_from_the_type() {
+        assert_eq!(residency("clip:vnode;"), Residency::Cpu);
+        assert_eq!(residency("clip:vnode"), Residency::Cpu);
+        assert_eq!(residency(""), Residency::Cpu);
 
-        assert!(!declares_gpu(b"clip:vnode;"));
-        assert!(!declares_gpu(b"clip:vnode"));
-        assert!(!declares_gpu(b""));
+        assert_eq!(residency("clip:vnode:gpu;"), Residency::Gpu);
+        assert_eq!(residency("clip:vnode:gpu"), Residency::Gpu);
+        assert_eq!(
+            residency("clip:vnode:gpu:whatever;alpha:vnode;"),
+            Residency::Gpu
+        );
+        assert_eq!(residency("alpha:vnode;clip:vnode:gpu;"), Residency::Gpu);
+
+        assert_eq!(residency("clip:vnode:all;"), Residency::All);
+        assert_eq!(residency("clip:vnode:all:whatever;"), Residency::All);
+        assert_eq!(residency("alpha:vnode;clip:vnode:all;"), Residency::All);
+
         // The type and the name are not modifiers.
-        assert!(!declares_gpu(b"clip:gpu;"));
-        assert!(!declares_gpu(b"gpu:vnode;"));
-        // A modifier that merely starts with `gpu` is a different modifier.
-        assert!(!declares_gpu(b"clip:vnode:gpu_thing;"));
+        assert_eq!(residency("clip:gpu;"), Residency::Cpu);
+        assert_eq!(residency("gpu:vnode;"), Residency::Cpu);
+        // A modifier that merely starts with one is a different modifier.
+        assert_eq!(residency("clip:vnode:gpu_thing;"), Residency::Cpu);
+        assert_eq!(residency("clip:vnode:all_thing;"), Residency::Cpu);
+        // `gpu` is the stricter of the two, so it settles the pair.
+        assert_eq!(residency("clip:vnode:gpu:all;"), Residency::Gpu);
+        assert_eq!(residency("clip:vnode:all;alpha:vnode:gpu;"), Residency::Gpu);
+    }
+
+    /// A filter that declares one return type and nothing else, so the default
+    /// answer [`Filter::gpu_output()`] gives can be read off it.
+    macro_rules! declared_filter {
+        ($name:ident, $return_type:expr) => {
+            struct $name;
+
+            impl Filter for $name {
+                type Error = &'static CStr;
+                type FrameType = VideoFrame;
+                type FilterData = ();
+
+                const NAME: &'static CStr = c"Declared";
+                const ARGS: &'static CStr = c"";
+                const RETURN_TYPE: &'static CStr = $return_type;
+
+                fn create(
+                    _input: MapRef,
+                    _output: MapRef,
+                    _data: Option<Box<Self::FilterData>>,
+                    _core: CoreRef,
+                ) -> Result<(), Self::Error> {
+                    Ok(())
+                }
+
+                fn get_frame(
+                    &self,
+                    _n: i32,
+                    _activation_reason: ffi::VSActivationReason,
+                    _frame_data: *mut *mut c_void,
+                    _frame_ctx: FrameContext,
+                    _core: CoreRef,
+                ) -> Result<Option<VideoFrame>, Self::Error> {
+                    Ok(None)
+                }
+            }
+        };
+    }
+
+    declared_filter!(CpuReturn, c"clip:vnode;");
+    declared_filter!(GpuReturn, c"clip:vnode:gpu;");
+    declared_filter!(AllReturn, c"clip:vnode:all;");
+
+    #[test]
+    fn the_declaration_answers_unless_it_cannot() {
+        assert!(!CpuReturn.gpu_output());
+        assert!(GpuReturn.gpu_output());
+    }
+
+    #[test]
+    #[should_panic(expected = "a `clip:vnode:all` return has to state its output residency")]
+    fn an_all_return_has_to_answer_per_instance() {
+        let _ = AllReturn.gpu_output();
     }
 }

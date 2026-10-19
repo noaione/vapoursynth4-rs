@@ -208,6 +208,10 @@ impl VideoNode {
         let filter = Box::new(filter);
         let name = CString::new(name).ok()?;
         let core = core.as_ref();
+        // As in `create_video_filter`: the flag is the instance's answer, so it
+        // is asked while the filter is still here to give it.
+        #[cfg(feature = "vs-43")]
+        let flags = crate::node::filter_flags(filter.as_ref());
         let ptr = unsafe {
             // As in [`Core::create_video_filter()`](crate::core::Core::create_video_filter):
             // the `Ex2` entry point is `createVideoFilter2` plus the filter flags.
@@ -218,7 +222,7 @@ impl VideoNode {
                 F::filter_get_frame,
                 Some(F::filter_free),
                 F::FILTER_MODE,
-                crate::node::filter_flags::<F>(),
+                flags,
                 dependencies.as_ptr(),
                 dependencies.len().try_into().unwrap(),
                 Box::into_raw(filter).cast(),

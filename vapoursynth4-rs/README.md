@@ -70,16 +70,26 @@ nothing but the caller knows the answer:
   memory region, publishing a plane's producer pair, and taking an input frame
   with `VideoNode::get_exportable_frame_filter()`.
 
-A GPU filter declares itself once: the `gpu` modifier on its return type, as in
-`clip:vnode:gpu`. The `VSFilterFlags::GPUOutput` the core also wants is read
-from that declaration, so the node and the type cannot disagree. The example in
-`sample-plugin` — `src/gpu_invert.rs`, run by `test_gpu.vpy` — does the whole
-thing with no `unsafe` in it at all: a shader compiled once, a pipeline built
-from it, one dispatch per plane recorded into a single submission, and a result
-compared byte for byte against the CPU inverse of the same clip.
+A GPU filter declares itself once: the residency modifier on its return type.
+`clip:vnode:gpu` means GPU resident frames and `clip:vnode` means host ones,
+and the `VSFilterFlags::GPUOutput` the core also wants is read from that
+declaration, so the node and the type cannot disagree. `clip:vnode:all` is the
+third form — the function can produce either — and that one is answered per
+instance by [`Filter::gpu_output()`][10]: a registered function can hand back a
+GPU frame for a caller that downloads it, or an ordinary host frame for a
+caller that never touches the device.
+
+The example in `sample-plugin` — `src/gpu_invert.rs`, run by `test_gpu.vpy` —
+does the whole thing with no `unsafe` in it at all: a shader compiled once, a
+pipeline built from it, one dispatch per plane recorded into a single
+submission, and a result compared byte for byte against the CPU inverse of the
+same clip. `src/residency.rs` is the smaller one, a pass-through that answers
+`all` from its own argument, run by `test_residency.vpy` and
+`test_residency_gpu.vpy`.
 
 [8]: https://docs.rs/vapoursynth4-rs/latest/vapoursynth4_rs/vulkan/
 [9]: https://docs.rs/vapoursynth4-rs/latest/vapoursynth4_rs/vulkan/struct.ComputePipeline.html
+[10]: https://docs.rs/vapoursynth4-rs/latest/vapoursynth4_rs/node/trait.Filter.html#method.gpu_output
 
 ## Building
 

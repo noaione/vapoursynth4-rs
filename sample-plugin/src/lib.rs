@@ -1,10 +1,12 @@
 mod dither;
 mod gpu_invert;
+mod residency;
 
 use std::ffi::{CStr, c_void};
 
 use dither::DitherFilter;
 use gpu_invert::InvertGpuFilter;
+use residency::ResidencyEcho;
 use vapoursynth4_rs::{
     SampleType,
     core::CoreRef,
@@ -127,6 +129,50 @@ impl Filter for DumbFilter {
     const RETURN_TYPE: &'static CStr = c"clip:vnode;";
 }
 
+/// A filter that panics with a formatted message instead of returning an
+/// error.
+///
+/// That is a plugin mistake rather than a plan, and the framework is what turns
+/// it into the invoke's error. It exists for one test: the payload of
+/// `panic!("{}", ...)` is a `String`, not the `&'static str` a bare literal
+/// produces, so a host that only reads the one it expects reads a message that
+/// is not there.
+struct PanicFilter;
+
+impl Filter for PanicFilter {
+    type Error = &'static CStr;
+    type FrameType = VideoFrame;
+    type FilterData = ();
+
+    const NAME: &'static CStr = c"Panic";
+    const ARGS: &'static CStr = c"clip:vnode;level:int:opt;";
+    const RETURN_TYPE: &'static CStr = c"clip:vnode;";
+
+    fn create(
+        input: MapRef,
+        _output: MapRef,
+        _data: Option<Box<Self::FilterData>>,
+        _core: CoreRef,
+    ) -> Result<(), Self::Error> {
+        let level = input.get_int(key!(c"level"), 0).unwrap_or(0);
+
+        // The formatting is the point: it is what makes the payload a
+        // `String` rather than a `&'static str`.
+        panic!("the sample panicked at level {level}");
+    }
+
+    fn get_frame(
+        &self,
+        _n: i32,
+        _activation_reason: ActivationReason,
+        _frame_data: *mut *mut c_void,
+        _ctx: FrameContext,
+        _core: CoreRef,
+    ) -> Result<Option<VideoFrame>, Self::Error> {
+        Ok(None)
+    }
+}
+
 declare_plugin!(
     c"com.example.invert",
     c"invert",
@@ -136,7 +182,9 @@ declare_plugin!(
     0,
     (DumbFilter, None),
     (DitherFilter, None),
-    (InvertGpuFilter, None)
+    (InvertGpuFilter, None),
+    (ResidencyEcho, None),
+    (PanicFilter, None)
 );
 
 #[cfg(test)]
@@ -144,6 +192,7 @@ mod tests {
     use testresult::TestResult;
     use vapoursynth4_rs::{
         api::Api,
+        ffi,
         frame::VideoFrame,
         node::{Node, VideoNode},
         sciprt::Script,
@@ -276,6 +325,139 @@ mod tests {
                 "plane {plane} of the GPU invert is not the inverse"
             );
         }
+
+        Ok(())
+    }
+
+    /// The same function, two answers. `clip:vnode:all;` has no residency of
+    /// its own, so the node and the frames it delivers report what the instance
+    /// said rather than what the type said.
+    #[test]
+    fn test_residency_is_chosen_per_instance() -> TestResult {
+        require_plugin();
+
+        let vss = Script::default();
+        vss.evaluate_file(c"test_residency.vpy")?;
+
+        for index in 0..2 {
+            let node = video_output(&vss, index)?;
+            assert_eq!(node.residency(), ffi::VSNodeResidency::CPU);
+
+            let frame = node
+                .get_frame(0)
+                .map_err(|error| error.to_string_lossy().into_owned())?;
+            assert_eq!(frame.residency(), ffi::VSNodeResidency::CPU);
+        }
+
+        Ok(())
+    }
+
+    /// The other answer, on a GPU input: an `all` argument is neither uploaded
+    /// nor downloaded, so a GPU clip arrives as one and goes back as one.
+    #[test]
+    fn test_residency_can_be_gpu() -> TestResult {
+        require_plugin();
+
+        if !gpu_available() {
+            eprintln!("no usable Vulkan device, skipping the GPU residency test");
+            return Ok(());
+        }
+
+        let vss = Script::default();
+        vss.evaluate_file(c"test_residency_gpu.vpy")?;
+
+        let node = video_output(&vss, 0)?;
+        assert_eq!(node.residency(), ffi::VSNodeResidency::GPU);
+
+        let frame = node
+            .get_frame(0)
+            .map_err(|error| error.to_string_lossy().into_owned())?;
+        assert_eq!(frame.residency(), ffi::VSNodeResidency::GPU);
+
+        Ok(())
+    }
+
+    /// A filter whose frames disagree with the flag it was created with is
+    /// ended by the core rather than handed back as an error, so the refusal can
+    /// only be seen from outside the process. The child is this same test
+    /// binary, running the ignored test below by name.
+    #[test]
+    fn a_filter_that_lies_about_its_frames_is_refused() -> TestResult {
+        require_plugin();
+
+        if !gpu_available() {
+            eprintln!("no usable Vulkan device, skipping the mismatched residency test");
+            return Ok(());
+        }
+
+        for case in ["1", "2"] {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "tests::mismatched_residency_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("SAMPLE_PLUGIN_RESIDENCY_CASE", case)
+                .output()?;
+
+            // A test that fails exits with a code; the core's check is
+            // `std::terminate`, which raises SIGABRT on Unix and exits with 3
+            // on Windows.
+            #[cfg(unix)]
+            let terminated = {
+                use std::os::unix::process::ExitStatusExt;
+                output.status.signal() == Some(6)
+            };
+            #[cfg(not(unix))]
+            let terminated = output.status.code() == Some(3);
+
+            assert!(
+                terminated,
+                "output {case} came back instead of ending the process: {:?}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Reads one of the outputs that disagree, which ends the process. Only run
+    /// by the test above, in a child of it.
+    #[test]
+    #[ignore = "run in a child process by a_filter_that_lies_about_its_frames_is_refused"]
+    fn mismatched_residency_child() -> TestResult {
+        require_plugin();
+
+        let case: i32 = std::env::var("SAMPLE_PLUGIN_RESIDENCY_CASE")?.parse()?;
+
+        let vss = Script::default();
+        vss.evaluate_file(c"test_residency_gpu.vpy")?;
+
+        // Asking for the frame is what makes the core compare it against the
+        // flag the filter was created with; it does not come back.
+        let _ = video_output(&vss, case)?.get_frame(0);
+
+        Ok(())
+    }
+
+    /// A panic inside a filter is the framework's problem rather than the
+    /// process's: the payload becomes the invoke's error, whatever type the
+    /// payload is.
+    #[test]
+    fn a_panic_comes_back_as_an_error() -> TestResult {
+        require_plugin();
+
+        let vss = Script::default();
+        let error = vss
+            .evaluate_file(c"test_panic.vpy")
+            .expect_err("the script should fail with the filter's panic");
+
+        assert!(
+            error.to_string().contains("the sample panicked at level 7"),
+            "{error}"
+        );
 
         Ok(())
     }

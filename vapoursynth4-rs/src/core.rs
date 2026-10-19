@@ -123,6 +123,11 @@ impl Core {
         dependencies: &Dependencies,
     ) {
         debug_assert!(!out.as_ptr().is_null());
+        // The flag is part of the creation rather than of the type: an `all`
+        // return is answered by the instance, so it is asked while the filter
+        // is still here to answer.
+        #[cfg(feature = "vs-43")]
+        let flags = crate::node::filter_flags(filter.as_ref());
         unsafe {
             // `createVideoFilterEx` is `createVideoFilter` with the filter flags
             // appended; with `vs-43` compiled in, the flags are always passed so
@@ -135,7 +140,7 @@ impl Core {
                 F::filter_get_frame,
                 Some(F::filter_free),
                 F::FILTER_MODE,
-                crate::node::filter_flags::<F>(),
+                flags,
                 dependencies.as_ptr(),
                 dependencies.len().try_into().unwrap(),
                 Box::into_raw(filter).cast(),

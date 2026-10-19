@@ -74,10 +74,10 @@ impl Filter for InvertGpuFilter {
 
     const NAME: &'static CStr = c"InvertGPU";
     const ARGS: &'static CStr = c"clip:vnode:gpu;";
-    /// `clip:vnode:gpu` is the whole GPU declaration. The modifier is what
-    /// makes the core hand the filter a device, and it is also what makes the
-    /// framework create the node with [`ffi::VSFilterFlags::GPUOutput`]; the
-    /// two can never disagree because only one of them is written down.
+    /// `clip:vnode:gpu` is the whole GPU declaration. The modifier is written
+    /// down once, and for a `gpu` or absent modifier it *is* the flag the node
+    /// is created with, so the two can never disagree; `all` is the one form
+    /// that leaves the answer to the instance, through [`Filter::gpu_output()`].
     const RETURN_TYPE: &'static CStr = c"clip:vnode:gpu;";
 
     fn create(
