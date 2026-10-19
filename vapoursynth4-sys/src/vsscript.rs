@@ -35,7 +35,9 @@ use std::ffi::{c_char, c_int};
 use super::{VSAPI, VSCore, VSMap, VSNode, opaque_struct, vs_make_version};
 
 pub const VSSCRIPT_API_MAJOR: u16 = 4;
-pub const VSSCRIPT_API_MINOR: u16 = if cfg!(feature = "vsscript-43") {
+pub const VSSCRIPT_API_MINOR: u16 = if cfg!(feature = "vsscript-44") {
+    4
+} else if cfg!(feature = "vsscript-43") {
     3
 } else if cfg!(feature = "vsscript-42") {
     2
@@ -49,6 +51,26 @@ opaque_struct!(
     /// through a [`VSScript`] object.
     VSScript
 );
+
+/// Flags taken by the `*Ex` functions. They control whether GPU resident nodes
+/// and frames are returned, or automatically downloaded, or silently rejected
+/// respectively. Added in `VSScript` API 4.4.
+#[cfg(feature = "vsscript-44")]
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+pub enum VSScriptGetFlags {
+    /// Return nodes and frames with the residency the script gave them.
+    AllowGPUResident = 1,
+}
+
+#[cfg(feature = "vsscript-44")]
+impl std::ops::BitOr for VSScriptGetFlags {
+    type Output = c_int;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        self as c_int | rhs as c_int
+    }
+}
 
 /// This struct is the way to access VSScript’s public API.
 #[allow(non_snake_case)]
@@ -227,6 +249,40 @@ pub struct VSSCRIPTAPI {
         handle: *mut VSScript,
         size: c_int,
         dst: *mut c_int,
+    ) -> c_int,
+    /// Same as [`getOutputNode()`](Self::getOutputNode), but takes
+    /// [`VSScriptGetFlags`]. Added in `VSScript` API 4.4.
+    #[cfg(feature = "vsscript-44")]
+    pub getOutputNodeEx: unsafe extern "system-unwind" fn(
+        handle: *mut VSScript,
+        index: c_int,
+        flags: c_int,
+    ) -> *mut VSNode,
+    /// Same as [`getOutputAlphaNode()`](Self::getOutputAlphaNode), but takes
+    /// [`VSScriptGetFlags`]. Added in `VSScript` API 4.4.
+    #[cfg(feature = "vsscript-44")]
+    pub getOutputAlphaNodeEx: unsafe extern "system-unwind" fn(
+        handle: *mut VSScript,
+        index: c_int,
+        flags: c_int,
+    ) -> *mut VSNode,
+    /// Same as [`getAvailableOutputNodes()`](Self::getAvailableOutputNodes),
+    /// but takes [`VSScriptGetFlags`]. Added in `VSScript` API 4.4.
+    #[cfg(feature = "vsscript-44")]
+    pub getAvailableOutputNodesEx: unsafe extern "system-unwind" fn(
+        handle: *mut VSScript,
+        size: c_int,
+        dst: *mut c_int,
+        flags: c_int,
+    ) -> c_int,
+    /// Same as [`getVariable()`](Self::getVariable), but takes
+    /// [`VSScriptGetFlags`]. Added in `VSScript` API 4.4.
+    #[cfg(feature = "vsscript-44")]
+    pub getVariableEx: unsafe extern "system-unwind" fn(
+        handle: *mut VSScript,
+        name: *const c_char,
+        dst: *mut VSMap,
+        flags: c_int,
     ) -> c_int,
 }
 

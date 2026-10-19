@@ -20,10 +20,15 @@ vs-43 = ["vs-42"]
 vsscript = [] # Base VSScript version is 4.1
 vsscript-42 = ["vsscript"]
 vsscript-43 = ["vsscript-42"]
+vsscript-44 = ["vsscript-43"]
 
 # Experimental features. Requires the library to be built with `VS_GRAPH_API`,
 # which is the case for all official builds.
 vs-graph = ["vs-42"]
+
+# The GPU side of API 4.3, see `VSVulkan4.h`. Implies `vs-43`; the bindings are
+# pure Rust, so no Vulkan SDK is needed to build, only to run a GPU filter.
+vs-vulkan = ["vs-43"]
 
 # Link the VS library
 link-vs = []

@@ -14,11 +14,16 @@ use std::ffi::{c_char, c_double, c_float, c_int, c_void};
 
 use super::{opaque_struct, vs_make_version};
 
+#[cfg(feature = "vs-vulkan")]
+use crate::vsvulkan::VSVULKANAPI;
+
 /// Major API version.
 pub const VAPOURSYNTH_API_MAJOR: u16 = 4;
 /// Minor API version. It is bumped when new functions are added to [`VSAPI`]
 /// or core behavior is noticeably changed.
-pub const VAPOURSYNTH_API_MINOR: u16 = if cfg!(feature = "vs-42") {
+pub const VAPOURSYNTH_API_MINOR: u16 = if cfg!(feature = "vs-43") {
+    3
+} else if cfg!(feature = "vs-42") {
     2
 } else if cfg!(feature = "vs-41") {
     1
@@ -262,6 +267,37 @@ pub enum VSFilterMode {
     /// one thread at a time. Unlike [`Unordered`](VSFilterMode::Unordered),
     /// only one frame is processed at a time.
     FrameState = 3,
+}
+
+/// Flags passed to [`createVideoFilterEx()`](VSAPI::createVideoFilterEx) and
+/// [`createVideoFilterEx2()`](VSAPI::createVideoFilterEx2). Added in API 4.3.
+#[cfg(feature = "vs-43")]
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+pub enum VSFilterFlags {
+    /// The filter returns GPU resident frames.
+    GPUOutput = 1,
+}
+
+#[cfg(feature = "vs-43")]
+impl std::ops::BitOr for VSFilterFlags {
+    type Output = c_int;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        self as c_int | rhs as c_int
+    }
+}
+
+/// Where a [`VSNode`]'s or [`VSFrame`]'s data lives. Added in API 4.3.
+#[cfg(feature = "vs-43")]
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+pub enum VSNodeResidency {
+    /// The node or frame is host resident.
+    CPU = 0,
+    /// The node or frame is GPU resident. A node reports this when it was created
+    /// with [`VSFilterFlags::GPUOutput`].
+    GPU = 1,
 }
 
 /// Used to indicate the type of a [`VSFrame`] or [`VSNode`] object.
@@ -814,6 +850,19 @@ pub struct VSFilterDependency {
     /// A value from [`VSRequestPattern`].
     pub request_pattern: VSRequestPattern,
 }
+// MARK: VSVulkan4
+
+opaque_struct!(
+    /// The GPU side of the API, retrieved through [`VSAPI::getVulkanAPI`].
+    ///
+    /// `VSVulkan4.h` is versioned by the core API rather than negotiated, so it has
+    /// no version of its own and the call cannot fail.
+    ///
+    /// Only the opaque handle is declared here unless the `vs-vulkan` feature is
+    /// enabled, which is what binds the struct's contents.
+    #[cfg(all(feature = "vs-43", not(feature = "vs-vulkan")))]
+    VSVULKANAPI
+);
 
 // MARK: VSAPI
 
@@ -2245,6 +2294,57 @@ pub struct VSAPI {
     #[cfg(feature = "vs-42")]
     pub getCoreInfo2: unsafe extern "system-unwind" fn(core: *mut VSCore, info: *mut VSCoreInfo2),
 
+    // MARK: API 4.3
+    /// Same as [`createVideoFilter()`](Self::createVideoFilter), but also takes
+    /// [`VSFilterFlags`] describing what the filter produces.
+    ///
+    /// Unknown flags are an error.
+    #[cfg(feature = "vs-43")]
+    pub createVideoFilterEx: unsafe extern "system-unwind" fn(
+        out: *mut VSMap,
+        name: *const c_char,
+        vi: *const VSVideoInfo,
+        getFrame: VSFilterGetFrame,
+        free: VSFilterFree,
+        filterMode: VSFilterMode,
+        flags: c_int,
+        dependencies: *const VSFilterDependency,
+        numDeps: c_int,
+        instanceData: *mut c_void,
+        core: *mut VSCore,
+    ),
+    /// Same as [`createVideoFilter2()`](Self::createVideoFilter2), but also takes
+    /// [`VSFilterFlags`] describing what the filter produces.
+    ///
+    /// Unknown flags return `NULL`.
+    #[cfg(feature = "vs-43")]
+    pub createVideoFilterEx2: unsafe extern "system-unwind" fn(
+        name: *const c_char,
+        vi: *const VSVideoInfo,
+        getFrame: VSFilterGetFrame,
+        free: VSFilterFree,
+        filterMode: VSFilterMode,
+        flags: c_int,
+        dependencies: *const VSFilterDependency,
+        numDeps: c_int,
+        instanceData: *mut c_void,
+        core: *mut VSCore,
+    ) -> *mut VSNode,
+    /// The GPU side of the API, described in `VSVulkan4.h`.
+    ///
+    /// Never `NULL`: it is versioned by the core API rather than negotiated, so
+    /// [`getAPIVersion()`](Self::getAPIVersion) is what says which one you got.
+    #[cfg(feature = "vs-43")]
+    pub getVulkanAPI: unsafe extern "system-unwind" fn() -> *const VSVULKANAPI,
+    /// Returns [`VSNodeResidency`], [`VSNodeResidency::GPU`] when the node was
+    /// created with [`VSFilterFlags::GPUOutput`].
+    #[cfg(feature = "vs-43")]
+    pub getNodeResidency: unsafe extern "system-unwind" fn(node: *mut VSNode) -> VSNodeResidency,
+    /// Returns [`VSNodeResidency`].
+    #[cfg(feature = "vs-43")]
+    pub getFrameResidency:
+        unsafe extern "system-unwind" fn(frame: *const VSFrame) -> VSNodeResidency,
+
     // MARK: Graph information
     /*
      * !!! Experimental/expensive graph information
@@ -2355,13 +2455,14 @@ mod tests {
         const BASE: usize = 106;
         const API_41: usize = 10;
         const API_42: usize = 1;
+        const API_43: usize = 5;
         const GRAPH: usize = 4;
 
         let expected = BASE
             + if cfg!(feature = "vs-41") { API_41 } else { 0 }
             + if cfg!(feature = "vs-42") { API_42 } else { 0 }
+            + if cfg!(feature = "vs-43") { API_43 } else { 0 }
             + if cfg!(feature = "vs-graph") { GRAPH } else { 0 };
-
         assert_eq!(
             std::mem::size_of::<VSAPI>(),
             expected * std::mem::size_of::<*const ()>(),
