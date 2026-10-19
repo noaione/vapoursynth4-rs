@@ -12,18 +12,19 @@ repository = "https://github.com/inflation/vapoursynth4-rs"
 [dependencies]
 bon = "3.10.1"
 thiserror = "2.0.20"
-vapoursynth4-sys = { version = "0.4.1", path = "../vapoursynth4-sys" }
+vapoursynth4-sys = { version = "0.5.0", path = "../vapoursynth4-sys" }
 
 [dev-dependencies]
 const-str = "1.1.0"
 testresult = "0.4.1"
 
 [features]
-default = ["vs-42", "vsscript", "vsscript-43"]
+default = ["vs-43", "vsscript", "vsscript-43"]
 link-vs = ["vapoursynth4-sys/link-vs"]
 link-vsscript = ["vapoursynth4-sys/link-vsscript"]
 vs-41 = ["vapoursynth4-sys/vs-41"]
 vs-42 = ["vapoursynth4-sys/vs-42", "vs-41"]
+vs-43 = ["vapoursynth4-sys/vs-43", "vs-42"]
 vsscript = ["vapoursynth4-sys/vsscript"]
 vsscript-42 = ["vapoursynth4-sys/vsscript-42", "vsscript"]
 vsscript-43 = ["vapoursynth4-sys/vsscript-43", "vsscript-42"]

@@ -6,7 +6,7 @@
 
 set -euxo pipefail
 
-VS_VERSION="${VS_VERSION:-79}"
+VS_VERSION="${VS_VERSION:-81}"
 
 python -m pip install --upgrade pip
 python -m pip install "vapoursynth==${VS_VERSION}"

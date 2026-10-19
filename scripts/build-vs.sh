@@ -14,7 +14,7 @@
 
 set -euxo pipefail
 
-VS_VERSION="${VS_VERSION:-R79}"
+VS_VERSION="${VS_VERSION:-R81}"
 
 ROOT="$PWD/vapoursynth"
 SRC="$ROOT/src-$VS_VERSION"
