@@ -41,7 +41,7 @@
 use core::ffi::{c_char, c_int, c_void};
 
 use super::vulkan::*;
-use super::{VSFrame, VSFrameContext, VSNode, VSCore, VSVideoFormat, opaque_struct};
+use super::{VSCore, VSFrame, VSFrameContext, VSNode, VSVideoFormat, opaque_struct};
 
 /// Whether a wait left it safe to destroy what a submission might still have
 /// been using.
@@ -479,7 +479,6 @@ pub struct VSVulkanDeviceListEntry {
 #[repr(C)]
 pub struct VSVULKANAPI {
     // MARK: Device selection and information
-
     /// Lists every physical device through a temporary instance, so it works
     /// before any device selection and needs no core.
     ///
@@ -555,11 +554,9 @@ pub struct VSVULKANAPI {
     /// # Return
     ///
     /// The previous limit.
-    pub setMaxVRAMUse:
-        unsafe extern "system-unwind" fn(bytes: i64, core: *mut VSCore) -> i64,
+    pub setMaxVRAMUse: unsafe extern "system-unwind" fn(bytes: i64, core: *mut VSCore) -> i64,
 
     // MARK: Calling Vulkan on the core's device
-
     /// Reports the instance, physical device, device and queue indices.
     ///
     /// # Arguments
@@ -634,7 +631,6 @@ pub struct VSVULKANAPI {
     pub unlockVulkanQueue: unsafe extern "system-unwind" fn(core: *mut VSCore, queue: c_int),
 
     // MARK: GPU resident frames
-
     /// Creates a GPU resident video frame for filter output.
     ///
     /// # Arguments
@@ -715,7 +711,6 @@ pub struct VSVULKANAPI {
     ),
 
     // MARK: Timelines, the semaphores producer pairs are published on
-
     /// Creates a timeline of your own, for filters recording and submitting
     /// without the core's exec pool.
     ///
@@ -798,7 +793,6 @@ pub struct VSVULKANAPI {
     ) -> c_int,
 
     // MARK: Memory from the core's pool
-
     /// Allocates scratch memory through the same sub allocator frame planes use,
     /// so it is counted against the VRAM limit, predicted by the thread pool's
     /// admission control and recycled through the size buckets.
@@ -977,7 +971,6 @@ pub struct VSVULKANAPI {
         unsafe extern "system-unwind" fn(reservation: *mut VSGPUMemoryReservation),
 
     // MARK: Shader compilation
-
     /// Compiles a shader at runtime, so plugins can ship readable kernel source
     /// instead of SPIR-V blobs.
     ///
@@ -1029,7 +1022,6 @@ pub struct VSVULKANAPI {
     pub freeGPUShader: unsafe extern "system-unwind" fn(shader: *mut VSGPUShader),
 
     // MARK: Exec pools
-
     /// Creates an exec pool on one of the core's queues.
     ///
     /// # Arguments
@@ -1174,7 +1166,6 @@ pub struct VSVULKANAPI {
         unsafe extern "system-unwind" fn(pool: *mut VSGPUExecPool) -> *mut VSGPUTimeline,
 
     // MARK: Recording contexts
-
     /// Claims a context and begins recording.
     ///
     /// # Arguments
@@ -1238,10 +1229,8 @@ pub struct VSVULKANAPI {
     ///
     /// Fatal on a frame with a plane handed to a foreign API; see
     /// [`VSVulkanExportedMemory`].
-    pub gpuExecReadsFrame: unsafe extern "system-unwind" fn(
-        context: *mut VSGPUExecContext,
-        frame: *const VSFrame,
-    ),
+    pub gpuExecReadsFrame:
+        unsafe extern "system-unwind" fn(context: *mut VSGPUExecContext, frame: *const VSFrame),
     /// Declares that this submission writes the plane.
     ///
     /// # Arguments
@@ -1288,10 +1277,8 @@ pub struct VSVULKANAPI {
     /// # Safety
     ///
     /// Ownership transfers; do not destroy it yourself.
-    pub gpuExecUsesBuffer: unsafe extern "system-unwind" fn(
-        context: *mut VSGPUExecContext,
-        buffer: *mut VSGPUBuffer,
-    ),
+    pub gpuExecUsesBuffer:
+        unsafe extern "system-unwind" fn(context: *mut VSGPUExecContext, buffer: *mut VSGPUBuffer),
     /// [`gpuExecUsesBuffer()`](Self::gpuExecUsesBuffer) for a bare region.
     ///
     /// # Arguments
@@ -1317,10 +1304,8 @@ pub struct VSVULKANAPI {
     /// created per frame has to outlive its submission too, so keep those handles
     /// and destroy them when the filter is freed rather than trying to guess when
     /// the submission retired.
-    pub gpuExecUsesMemory: unsafe extern "system-unwind" fn(
-        context: *mut VSGPUExecContext,
-        memory: *mut VSGPUMemory,
-    ),
+    pub gpuExecUsesMemory:
+        unsafe extern "system-unwind" fn(context: *mut VSGPUExecContext, memory: *mut VSGPUMemory),
     /// Registers cleanup of your own on the retention list, for what the typed
     /// calls above cannot name.
     ///
@@ -1405,7 +1390,6 @@ pub struct VSVULKANAPI {
     pub gpuExecAbandon: unsafe extern "system-unwind" fn(context: *mut VSGPUExecContext),
 
     // MARK: Sharing frames with other APIs
-
     /// Exports the allocation backing a GPU frame plane as an opaque handle.
     ///
     /// # Arguments
@@ -1662,12 +1646,7 @@ mod tests {
 
         let mut error = [0 as c_char; 512];
         let count = unsafe {
-            ((*vk).enumerateVulkanDevices)(
-                core::ptr::null_mut(),
-                0,
-                error.as_mut_ptr(),
-                error.len() as c_int,
-            )
+            ((*vk).enumerateVulkanDevices)(core::ptr::null_mut(), 0, error.as_mut_ptr(), 512)
         };
         assert!(
             count >= 0,

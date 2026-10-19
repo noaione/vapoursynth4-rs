@@ -6,10 +6,12 @@
 
 use std::ops::Deref;
 
+#[cfg(any(feature = "link-vs", feature = "link-vsscript"))]
 use vapoursynth4_sys::vs_make_version;
 
 use crate::ffi;
 
+#[cfg(any(feature = "link-vs", feature = "link-vsscript"))]
 use self::error::ApiNotFound;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

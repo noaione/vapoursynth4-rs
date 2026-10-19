@@ -71,6 +71,7 @@ Those are generated from the Khronos header and checked in as
 scripts/gen-vulkan-bindings.py \
     "$VULKAN_SDK/include/vulkan/vulkan_core.h" \
     "$VS_DIR/include/VSVulkan4.h" > src/vulkan.rs
+cargo fmt -p vapoursynth4-sys
 ```
 
 `src/vsvulkan.rs` is hand written in the style of the rest of the crate and is
@@ -79,7 +80,9 @@ not generated.
 Because these are FFI structs, the generated layout is verified against the C
 compiler rather than trusted. `scripts/check-vulkan-layout.sh` compiles a C and
 a Rust probe over the same headers and diffs `sizeof`, `_Alignof` and
-`offsetof` for every aggregate, and also fails if the checked-in file is stale:
+`offsetof` for every aggregate, and also fails if the checked-in file is stale
+(the comparison is against the generator's output, formatted, so regenerating
+and running `cargo fmt` is all it takes to satisfy it):
 
 ```sh
 scripts/check-vulkan-layout.sh "$VULKAN_SDK/include" "$VS_DIR/include"

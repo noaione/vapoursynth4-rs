@@ -42,6 +42,33 @@ Each version feature enables the ones below it. Note that API 4.2 replaces the
 `_ColorRange` frame property with `_Range`, whose two values are the other way
 around; enabling `vs-42` deprecates `VSColorRange` in favour of `VSRange`.
 
+## GPU filters
+
+Enabling `vs-vulkan` adds the [`vulkan`][8] module, the safe wrapper over
+`VSVulkan4.h`. It is opt-in rather than part of the default set, so nothing
+changes for a filter that only ever produces CPU frames.
+
+The module covers what the library can check and leaves the rest `unsafe`,
+because most of those calls are fatal when misused and none can be checked
+against device state:
+
+- Owned handles — `Timeline`, `Shader`, `GpuBuffer`, `GpuMemory`,
+  `GpuMemoryReservation` and `ExecPool` — that give their resource back when
+  dropped.
+- Device and core information as owned data, through
+  `VsVulkanApi::enumerate_devices()` and `Core::vulkan_core_info()`; GPU frames
+  through `Core::new_gpu_video_frame()`, and their planes and residency through
+  `VideoFrame::gpu_plane()` and `VideoFrame::residency()`.
+- Everything that records or publishes GPU work stays `unsafe`: locking a
+  queue, acquiring and submitting an exec context, publishing a plane's
+  producer pair, and taking an input frame with
+  `VideoNode::get_exportable_frame_filter()`.
+
+Declaring a filter's output GPU resident (`VSFilterFlags::GPUOutput`) is not
+part of the safe registration API yet; use the raw bindings for that.
+
+[8]: https://docs.rs/vapoursynth4-rs/latest/vapoursynth4_rs/vulkan/
+
 ## Building
 
 Linking is optional and enabled with the `link-vs` and `link-vsscript` features.

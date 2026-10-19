@@ -1962,7 +1962,7 @@ pub struct VSAPI {
     /// # Arguments
     ///
     /// * `name` - Filter name. The characters allowed are letters, numbers, and the underscore.
-    ///   The first character must be a letter. In other words: ^[a-zA-Z][a-zA-Z0-9_]*$
+    ///   The first character must be a letter. In other words: `^\[a-zA-Z]\[a-zA-Z0-9_]*$`
     ///
     ///     Filter names _should be_ `PascalCase`.
     ///

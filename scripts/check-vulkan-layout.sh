@@ -40,16 +40,21 @@ check="vapoursynth4-sys/src/vulkan.rs"
 
 # Regenerate into the scratch dir, so a stale checked-in file is caught.
 python3 "$ROOT/scripts/gen-vulkan-bindings.py" \
-    "$VULKAN_INC/vulkan/vulkan_core.h" "$VS_INC/VSVulkan4.h" >"$WORK/vulkan.rs"
+    "$VULKAN_INC/vulkan/vulkan_core.h" "$VS_INC/VSVulkan4.h" >"$WORK/raw.rs"
+
+# The generator emits plain text and the checked-in file is formatted, so the
+# comparison has to be against formatted output; otherwise running `cargo fmt`
+# alone would fail this check.
+cp "$WORK/raw.rs" "$WORK/vulkan.rs"
+rustfmt --edition 2024 "$WORK/vulkan.rs"
 
 if ! diff -q "$WORK/vulkan.rs" "$ROOT/$check" >/dev/null 2>&1; then
-    echo "FAIL: $check is out of date; regenerate it with scripts/gen-vulkan-bindings.py" >&2
+    echo "FAIL: $check is out of date; regenerate it with scripts/gen-vulkan-bindings.py and run cargo fmt" >&2
     diff -u "$ROOT/$check" "$WORK/vulkan.rs" | head -60 >&2
     exit 1
 fi
-
 python3 "$ROOT/scripts/gen-vulkan-bindings.py" --layout "$WORK" \
-    "$VULKAN_INC/vulkan/vulkan_core.h" "$VS_INC/VSVulkan4.h" "$WORK/vulkan.rs" >/dev/null
+    "$VULKAN_INC/vulkan/vulkan_core.h" "$VS_INC/VSVulkan4.h" "$WORK/raw.rs" >/dev/null
 
 cc -std=c11 -I"$VULKAN_INC" -I"$VS_INC" -o "$WORK/layout_c" "$WORK/layout.c"
 rustc --edition 2024 -O -o "$WORK/layout_rs" "$WORK/layout.rs"

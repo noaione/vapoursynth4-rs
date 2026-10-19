@@ -16,6 +16,8 @@ pub mod node;
 pub mod plugin;
 pub mod sciprt;
 pub mod utils;
+#[cfg(feature = "vs-vulkan")]
+pub mod vulkan;
 
 pub use vapoursynth4_sys as ffi;
 

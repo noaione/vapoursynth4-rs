@@ -189,10 +189,40 @@ def compute_closure(core_text, vs_text, decls):
         d = decls.get(name)
         if d:
             stack.extend(x for x in d.deps if x not in seen)
+            stack.extend(x for x in flag_bits_siblings(name) if x not in seen)
     missing = sorted(x for x in seen if x not in decls)
     # Names the closure reaches but the header never declares as a typedef: they
     # come from the `PFN_vkVoidFunction` family or are macros, so drop them.
     return seen, missing, fns
+
+
+def flag_bits_siblings(name):
+    """The `Vk*FlagBits` enum naming the bits of a `Vk*Flags` alias.
+
+    A flags type is an alias for `VkFlags`, so the walk never reaches the enum
+    that spells its bits out -- and that enum is the vocabulary a caller needs
+    to pass one. `Vk*Flags2` only ever appears as a `VkFlags64` alias whose
+    constants are `#define`s, so this is a no-op for those.
+    """
+    m = re.fullmatch(r"Vk(.+?)Flags(2?)([A-Z0-9_]*)", name)
+    if m is None:
+        return ()
+    stem, two, suffix = m.groups()
+    return (f"Vk{stem}FlagBits{two}{suffix}",)
+
+
+def paired_flags(name):
+    """The `Vk*Flags` alias a `Vk*FlagBits` enum spells its bits for.
+
+    Vulkan never uses the `*FlagBits` name as a parameter or a field type -- the
+    C API always passes the `Vk*Flags` alias -- so emitting the enum as an alias
+    of that type keeps its constants usable as the flag values they are instead
+    of making every call site cast an `int`."""
+    m = re.fullmatch(r"Vk(.+?)FlagBits(2?)([A-Z0-9_]*)", name)
+    if m is None:
+        return None
+    stem, two, suffix = m.groups()
+    return f"Vk{stem}Flags{two}{suffix}"
 
 
 # MARK: emission
@@ -450,6 +480,19 @@ def collect_defines(text: str):
     return out
 
 
+def collect_flag_bits2(text: str):
+    """The `static const Vk*FlagBits2 NAME = value;` declarations in a header.
+
+    Vulkan 1.4 spells the synchronization2 bits this way rather than as an enum,
+    so the closure reaches the type and never its values.
+    """
+    return re.findall(
+        r"^[ \t]*static const (Vk\w+FlagBits2) (VK_[A-Z0-9_]+) = ([^;]+);",
+        text,
+        re.M,
+    )
+
+
 def strip_preprocessor(text: str) -> str:
     """Drop `#if`/`#endif` lines, which some enum bodies carry."""
     return re.sub(r"^[ \t]*#.*$", "", text, flags=re.M)
@@ -467,6 +510,7 @@ def main():
     _hv = re.search(r"#define\s+VK_HEADER_VERSION\s+(\d+)", raw_core)
     header_version = _hv.group(1) if _hv else "unknown"
     defines = collect_defines(raw_core)
+    flag_bits2 = collect_flag_bits2(raw_core)
     core = strip_comments(strip_preprocessor(raw_core))
     vs = strip_comments(open(vs_path).read())
     # The handle macros sit on preprocessor lines, so re-add them verbatim.
@@ -532,10 +576,24 @@ def main():
         w(f"pub type {name} = {c_type_to_rust(base)};")
     w("")
 
+    # `Vk*FlagBits2` is a `VkFlags64` alias rather than an enum, so the closure
+    # reaches the type and never its values. The declaration names the type,
+    # which is exactly the Rust type the constant needs.
+    sync2 = [(ty, name, val) for ty, name, val in flag_bits2 if ty in needed]
+    if sync2:
+        w("// MARK: Synchronization2 flag bits")
+        for ty, name, val in sync2:
+            w(f"pub const {name}: {ty} = {_clean_const(val)};")
+        w("")
+
     w("// MARK: Enums")
     for name in by_kind["enum"]:
         body = decls[name].body
-        w(f"pub type {name} = {ENUM_BASE};")
+        paired = paired_flags(name)
+        if paired is not None and paired in needed:
+            w(f"pub type {name} = {paired};")
+        else:
+            w(f"pub type {name} = {ENUM_BASE};")
         last = None
         for cn, val in parse_enum_constants(body):
             if val is None:
