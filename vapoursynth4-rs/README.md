@@ -23,7 +23,7 @@ Check out [`vapoursynth4-sys`](https://crates.io/crates/vapoursynth4-sys) for th
 ## Supported Versions
 
 All VapourSynth and VSScript API versions starting with 4.0 are supported,
-up to VapourSynth API 4.3 and VSScript API 4.3 (R79).
+up to VapourSynth API 4.3 and VSScript API 4.4 (R81).
 By default, the crate uses the latest API version available.
 To use a specific version,
 disable the default features and enable the corresponding Cargo feature:
@@ -34,7 +34,9 @@ disable the default features and enable the corresponding Cargo feature:
 - `vsscript` for VSScript API 4.1, the base version
 - `vsscript-42` for VSScript API 4.2 (R69)
 - `vsscript-43` for VSScript API 4.3 (R79)
+- `vsscript-44` for VSScript API 4.4 (R80)
 - `vs-graph` for the experimental graph inspection API (implies `vs-42`)
+- `vs-vulkan` for the `VSVulkan4` GPU API (implies `vs-43`)
 
 Each version feature enables the ones below it. Note that API 4.2 replaces the
 `_ColorRange` frame property with `_Range`, whose two values are the other way
@@ -49,7 +51,7 @@ The simplest way to get them on any platform is the official wheel, which is the
 same payload the Windows installer and the portable zip ship since R74:
 
 ```sh
-pip install vapoursynth==79
+pip install vapoursynth==81
 ```
 
 Use the `VAPOURSYNTH_LIB_PATH` environment variable to point at the directory
