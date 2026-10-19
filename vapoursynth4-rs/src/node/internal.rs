@@ -1,4 +1,5 @@
 use std::{
+    any::Any,
     ffi::{c_int, c_void},
     mem::ManuallyDrop,
     panic::AssertUnwindSafe,
@@ -42,8 +43,7 @@ pub trait FilterExtern: Filter {
                     output.set_error(e.as_ref());
                 }
                 Err(p) => {
-                    let e = p.downcast::<&str>().unwrap_unchecked();
-                    output.set_error(&e.into_cstring_lossy());
+                    output.set_error(&panic_message(&*p).into_cstring_lossy());
                 }
                 _ => {}
             }
@@ -78,8 +78,7 @@ pub trait FilterExtern: Filter {
                     ctx.set_filter_error(e.as_ref());
                 }
                 Err(p) => {
-                    let e = p.downcast::<&str>().unwrap_unchecked();
-                    ctx.set_filter_error(&e.into_cstring_lossy());
+                    ctx.set_filter_error(&panic_message(&*p).into_cstring_lossy());
                 }
                 _ => {}
             }
@@ -104,3 +103,42 @@ pub trait FilterExtern: Filter {
 }
 
 impl<F> FilterExtern for F where F: Filter {}
+
+/// What a panicking filter's payload says, as text.
+///
+/// A payload is a `&'static str` only when the panic used a bare literal:
+/// `panic!("{n}")`, `expect` with a formatted message and a failed bounds
+/// check all hand back a `String` instead, and a payload need not be text at
+/// all. The message is the one thing the filter's author has to work with, so
+/// what cannot be read says something rather than nothing.
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("the filter panicked")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::any::Any;
+
+    use super::panic_message;
+
+    /// A payload as `catch_unwind` hands one back.
+    fn payload(value: impl Any + Send) -> Box<dyn Any + Send> {
+        Box::new(value)
+    }
+
+    #[test]
+    fn a_panic_payload_is_read_as_text() {
+        // `panic!("...")` and `panic!("{x}")` differ only in the payload type.
+        assert_eq!(panic_message(&*payload("a literal")), "a literal");
+        assert_eq!(
+            panic_message(&*payload(String::from("formatted 7"))),
+            "formatted 7"
+        );
+        // Anything else still has to say something.
+        assert_eq!(panic_message(&*payload(7_u32)), "the filter panicked");
+    }
+}
