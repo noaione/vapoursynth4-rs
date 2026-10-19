@@ -39,10 +39,11 @@
 //! which is why creating and reading them is safe.
 
 use std::{
+    cell::Cell,
     ffi::{CStr, c_char, c_void},
     hash::{Hash, Hasher},
     marker::PhantomData,
-    mem::{MaybeUninit, forget},
+    mem::{MaybeUninit, forget, size_of_val},
     ops::Deref,
     ptr::{NonNull, null, null_mut},
     slice,
@@ -529,6 +530,376 @@ impl Drop for Shader {
     }
 }
 
+/// A compute pipeline on the core's device.
+///
+/// Building one turns a compiled [`Shader`] into everything a dispatch needs: a
+/// shader module, a descriptor set layout with one `storage buffer` per declared
+/// binding, a pipeline layout carrying the push constants, and the pipeline
+/// itself. Each is created once and destroyed with this value.
+///
+/// Descriptors are pushed onto the command buffer rather than written into a set
+/// allocated from a pool, so a pipeline owns no descriptor pool to reset between
+/// frames.
+#[derive(Debug)]
+pub struct ComputePipeline {
+    vk: ffi::VSVulkanFunctions,
+    device: ffi::VkDevice,
+    shader_module: ffi::VkShaderModule,
+    set_layout: ffi::VkDescriptorSetLayout,
+    layout: ffi::VkPipelineLayout,
+    pipeline: ffi::VkPipeline,
+    /// How many `storage buffer` bindings the layout declares, numbered from
+    /// zero. A dispatch has to bind exactly this many buffers.
+    bindings: u32,
+    /// The push constant block's size in bytes, at offset zero.
+    push_constant_size: u32,
+}
+
+// SAFETY: every field is a handle or a number, the handles are created on the
+// core's device and immutable once built, and everything done with them is a
+// Vulkan call, which the specification makes thread safe. The device outlives
+// the pipeline because the core owns it.
+unsafe impl Send for ComputePipeline {}
+// SAFETY: as above. A pipeline holds no per thread state, which is what lets one
+// instance serve every worker thread a filter is called on.
+unsafe impl Sync for ComputePipeline {}
+
+impl ComputePipeline {
+    /// Starts building a pipeline that runs `shader`.
+    #[must_use]
+    pub fn builder<'a>(core: &'a Core, shader: &'a Shader) -> ComputePipelineBuilder<'a> {
+        ComputePipelineBuilder {
+            core,
+            shader,
+            bindings: 0,
+            push_constant_size: 0,
+        }
+    }
+
+    /// How many `storage buffer` bindings the layout declares.
+    #[must_use]
+    pub fn bindings(&self) -> u32 {
+        self.bindings
+    }
+
+    /// The raw `VkPipeline`.
+    #[must_use]
+    pub fn as_ptr(&self) -> ffi::VkPipeline {
+        self.pipeline
+    }
+}
+
+impl Drop for ComputePipeline {
+    fn drop(&mut self) {
+        // SAFETY: each handle was created on this device and is given back
+        // exactly once. Nothing is still using them: a pipeline only reaches the
+        // GPU through a recording, and every recording is submitted or abandoned
+        // before the filter instance holding this is dropped.
+        unsafe {
+            if self.pipeline != 0
+                && let Some(destroy) = self.vk.vkDestroyPipeline
+            {
+                destroy(self.device, self.pipeline, null());
+            }
+            if self.layout != 0
+                && let Some(destroy) = self.vk.vkDestroyPipelineLayout
+            {
+                destroy(self.device, self.layout, null());
+            }
+            if self.set_layout != 0
+                && let Some(destroy) = self.vk.vkDestroyDescriptorSetLayout
+            {
+                destroy(self.device, self.set_layout, null());
+            }
+            if self.shader_module != 0
+                && let Some(destroy) = self.vk.vkDestroyShaderModule
+            {
+                destroy(self.device, self.shader_module, null());
+            }
+        }
+    }
+}
+
+/// Builds a [`ComputePipeline`].
+///
+/// Every [`storage_buffer()`](Self::storage_buffer) declares one binding, and the
+/// order is the binding order: the first is `set = 0, binding = 0`, the second is
+/// `binding = 1`, and so on. [`ExecContext::dispatch()`] binds its buffers in the
+/// same order, which makes a pipeline the one place that decides what a shader
+/// sees.
+#[derive(Debug)]
+pub struct ComputePipelineBuilder<'a> {
+    core: &'a Core,
+    shader: &'a Shader,
+    bindings: u32,
+    push_constant_size: u32,
+}
+
+impl ComputePipelineBuilder<'_> {
+    /// Declares one `readonly buffer` or `writeonly buffer` binding.
+    #[must_use]
+    pub fn storage_buffer(mut self) -> Self {
+        self.bindings = self.bindings.saturating_add(1);
+        self
+    }
+
+    /// Declares a push constant block of `size` bytes at offset zero.
+    ///
+    /// Zero, which is the default, declares none. A size that is not a multiple
+    /// of four is rounded up, since the specification requires the range to be
+    /// one and every member a shader can put in the block is at least that wide.
+    /// A block at another offset needs the raw path through
+    /// [`ExecPool::acquire()`].
+    #[must_use]
+    pub fn push_constants(mut self, size: u32) -> Self {
+        self.push_constant_size = size.div_ceil(4).saturating_mul(4);
+        self
+    }
+
+    /// Creates the shader module, both layouts and the pipeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VulkanError`] when the core is on no device, when it did not
+    /// resolve an entry point this needs, or when the driver refused to create
+    /// one of the objects. Whatever was created before the failure is destroyed.
+    pub fn build(self) -> Result<ComputePipeline, VulkanError> {
+        let vk = *self.core.vulkan_functions()?;
+        let device = self.core.vulkan_handles()?.device;
+        let mut this = ComputePipeline {
+            vk,
+            device,
+            shader_module: 0,
+            set_layout: 0,
+            layout: 0,
+            pipeline: 0,
+            bindings: self.bindings,
+            push_constant_size: self.push_constant_size,
+        };
+
+        this.create_shader_module(self.shader.code())?;
+        this.create_set_layout()?;
+        this.create_layout()?;
+        this.create_pipeline()?;
+
+        Ok(this)
+    }
+}
+
+impl ComputePipeline {
+    /// Creates the shader module from the compiled words.
+    ///
+    /// The first step of [`ComputePipelineBuilder::build()`] is split out from
+    /// the rest so that each `unsafe` block is one call with one contract, and
+    /// so a failure leaves behind exactly what `Drop` destroys.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VulkanError`] when the core did not resolve
+    /// `vkCreateShaderModule` or the driver refused to create the module.
+    fn create_shader_module(&mut self, code: &[u32]) -> Result<(), VulkanError> {
+        let info = ffi::VkShaderModuleCreateInfo {
+            sType: ffi::VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            pNext: null(),
+            flags: 0,
+            codeSize: size_of_val(code),
+            pCode: code.as_ptr(),
+        };
+
+        // SAFETY: the module is created on the core's device from the create-info
+        // the specification asks for, and assigned into a field that `Drop`
+        // destroys. The words outlive the call.
+        unsafe {
+            let create = self.vk.vkCreateShaderModule.ok_or_else(|| {
+                VulkanError::new(None, "the core did not resolve vkCreateShaderModule")
+            })?;
+
+            if create(
+                self.device,
+                &raw const info,
+                null(),
+                &raw mut self.shader_module,
+            ) != ffi::VK_SUCCESS
+            {
+                return Err(VulkanError::new(None, "could not create the shader module"));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Creates the descriptor set layout: one pushed `storage buffer` binding per
+    /// declared binding, numbered from zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VulkanError`] when the core did not resolve
+    /// `vkCreateDescriptorSetLayout` or the driver refused to create the layout.
+    fn create_set_layout(&mut self) -> Result<(), VulkanError> {
+        let bindings: Vec<ffi::VkDescriptorSetLayoutBinding> = (0..self.bindings)
+            .map(|binding| ffi::VkDescriptorSetLayoutBinding {
+                binding,
+                descriptorType: ffi::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                descriptorCount: 1,
+                stageFlags: ffi::VK_SHADER_STAGE_COMPUTE_BIT,
+                pImmutableSamplers: null(),
+            })
+            .collect();
+        let info = ffi::VkDescriptorSetLayoutCreateInfo {
+            sType: ffi::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            pNext: null(),
+            // Pushed onto the command buffer rather than written into a set
+            // taken from a pool, which the layout has to say.
+            flags: ffi::VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT,
+            bindingCount: u32::try_from(bindings.len()).unwrap_or(0),
+            pBindings: bindings.as_ptr(),
+        };
+
+        // SAFETY: as in [`Self::create_shader_module()`], and the bindings array
+        // outlives the call.
+        unsafe {
+            let create = self.vk.vkCreateDescriptorSetLayout.ok_or_else(|| {
+                VulkanError::new(None, "the core did not resolve vkCreateDescriptorSetLayout")
+            })?;
+
+            if create(
+                self.device,
+                &raw const info,
+                null(),
+                &raw mut self.set_layout,
+            ) != ffi::VK_SUCCESS
+            {
+                return Err(VulkanError::new(
+                    None,
+                    "could not create the descriptor set layout",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Creates the pipeline layout: set 0, and the push constant block when one
+    /// was declared.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VulkanError`] when the core did not resolve
+    /// `vkCreatePipelineLayout` or the driver refused to create the layout.
+    fn create_layout(&mut self) -> Result<(), VulkanError> {
+        let set_layouts = [self.set_layout];
+        let ranges = [ffi::VkPushConstantRange {
+            stageFlags: ffi::VK_SHADER_STAGE_COMPUTE_BIT,
+            offset: 0,
+            size: self.push_constant_size,
+        }];
+        let info = ffi::VkPipelineLayoutCreateInfo {
+            sType: ffi::VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            pNext: null(),
+            flags: 0,
+            setLayoutCount: 1,
+            pSetLayouts: set_layouts.as_ptr(),
+            pushConstantRangeCount: u32::from(self.push_constant_size != 0),
+            pPushConstantRanges: ranges.as_ptr(),
+        };
+
+        // SAFETY: as in [`Self::create_shader_module()`], and both arrays outlive
+        // the call.
+        unsafe {
+            let create = self.vk.vkCreatePipelineLayout.ok_or_else(|| {
+                VulkanError::new(None, "the core did not resolve vkCreatePipelineLayout")
+            })?;
+
+            if create(self.device, &raw const info, null(), &raw mut self.layout) != ffi::VK_SUCCESS
+            {
+                return Err(VulkanError::new(
+                    None,
+                    "could not create the pipeline layout",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Creates the compute pipeline itself, with `main` as its entry point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VulkanError`] when the core did not resolve
+    /// `vkCreateComputePipelines` or the driver refused to create the pipeline.
+    fn create_pipeline(&mut self) -> Result<(), VulkanError> {
+        let stage = ffi::VkPipelineShaderStageCreateInfo {
+            sType: ffi::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            pNext: null(),
+            flags: 0,
+            stage: ffi::VK_SHADER_STAGE_COMPUTE_BIT,
+            module: self.shader_module,
+            pName: c"main".as_ptr(),
+            pSpecializationInfo: null(),
+        };
+        let info = ffi::VkComputePipelineCreateInfo {
+            sType: ffi::VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            pNext: null(),
+            flags: 0,
+            stage,
+            layout: self.layout,
+            basePipelineHandle: 0,
+            basePipelineIndex: -1,
+        };
+
+        // SAFETY: as in [`Self::create_shader_module()`]. No pipeline cache: this
+        // is one pipeline, created once.
+        unsafe {
+            let create = self.vk.vkCreateComputePipelines.ok_or_else(|| {
+                VulkanError::new(None, "the core did not resolve vkCreateComputePipelines")
+            })?;
+
+            if create(
+                self.device,
+                0,
+                1,
+                &raw const info,
+                null(),
+                &raw mut self.pipeline,
+            ) != ffi::VK_SUCCESS
+            {
+                return Err(VulkanError::new(
+                    None,
+                    "could not create the compute pipeline",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// One plane of a GPU frame, declared and ready to bind into a dispatch.
+///
+/// [`ExecContext::read_plane()`] and [`ExecContext::write_plane()`] hand one out,
+/// which is what ties a binding to a declaration: the call that returns the
+/// buffer is the same one that makes the recording keep the frame alive until
+/// the submission completes.
+#[derive(Clone, Copy, Debug)]
+pub struct DispatchPlane {
+    info: ffi::VSVulkanPlaneInfo,
+}
+
+impl DispatchPlane {
+    /// The bytes the plane's buffer covers, which is its stride times its height.
+    #[must_use]
+    pub fn size(&self) -> ffi::VkDeviceSize {
+        self.info.buffer_size
+    }
+
+    /// The raw `VkBuffer`, for a binding recorded by hand.
+    #[must_use]
+    pub fn buffer(&self) -> ffi::VkBuffer {
+        self.info.buffer
+    }
+}
+
 /// A scratch buffer from the core's memory pool.
 ///
 /// This comes from the same sub allocator frame planes do, so it is counted
@@ -780,6 +1151,40 @@ unsafe impl Send for ExecPool {}
 // the calling thread's own state, not because of data races.
 unsafe impl Sync for ExecPool {}
 
+// Set while this thread is inside `ExecPool::record()`.
+//
+// The one context per thread rule is the whole reason `ExecPool::acquire()`
+// is `unsafe`, and a recording that cannot outlive a call is exactly what makes
+// it checkable, so it is checked here instead of documented.
+std::thread_local! {
+    static RECORDING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Clears this thread's recording claim again, however `record` ends.
+struct RecordingClaim;
+
+impl RecordingClaim {
+    /// Claims the calling thread, or reports that it already holds a recording.
+    fn claim() -> Result<Self, VulkanError> {
+        RECORDING.with(|recording| {
+            if recording.replace(true) {
+                return Err(VulkanError::new(
+                    None,
+                    "this thread already holds an exec context",
+                ));
+            }
+
+            Ok(RecordingClaim)
+        })
+    }
+}
+
+impl Drop for RecordingClaim {
+    fn drop(&mut self) {
+        RECORDING.with(|recording| recording.set(false));
+    }
+}
+
 impl ExecPool {
     /// The pool's own timeline.
     ///
@@ -826,6 +1231,7 @@ impl ExecPool {
                 handle,
                 api: self.api,
                 _pool: PhantomData,
+                declared: [null(); DECLARED_READ_SLOTS],
             })
             .ok_or_else(|| VulkanError::new(message, "could not acquire an exec context"))
     }
@@ -883,6 +1289,44 @@ impl ExecPool {
             )
         })
     }
+
+    /// Runs `f` against one recording and submits it.
+    ///
+    /// This is the safe way to record: the context is claimed for this thread,
+    /// handed to `f`, and submitted when `f` returns without an error. It cannot
+    /// outlive the call, so the one context per thread rule that makes
+    /// [`ExecPool::acquire()`] `unsafe` is checked here, and a nested call is
+    /// refused rather than being fatal.
+    ///
+    /// The returned value is the submission's point on
+    /// [`ExecPool::timeline()`], which is what [`ExecPool::wait_value()`] takes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VulkanError`] if this thread already holds a recording, if no
+    /// context could be claimed, if `f` returned one, in which case the recording
+    /// is abandoned rather than submitted, or if the submission failed.
+    pub fn record<F>(&self, f: F) -> Result<u64, VulkanError>
+    where
+        F: FnOnce(&mut ExecContext<'_>) -> Result<(), VulkanError>,
+    {
+        let _claim = RecordingClaim::claim()?;
+
+        // SAFETY: the claim proves this thread holds no other recording, which
+        // is all `acquire` asks of its caller.
+        let mut context = unsafe { self.acquire()? };
+
+        if let Err(error) = f(&mut context) {
+            context.abandon();
+            return Err(error);
+        }
+
+        // SAFETY: the recording is submitted from the thread that claimed it, and
+        // every declaration made against it came from this API: frames were
+        // declared by the calls that handed out their planes, and nothing was
+        // handed over by hand.
+        unsafe { context.submit() }
+    }
 }
 
 impl Drop for ExecPool {
@@ -892,6 +1336,12 @@ impl Drop for ExecPool {
         unsafe { (self.api.freeGPUExecPool)(self.handle.as_ptr()) };
     }
 }
+
+/// How many frames one recording remembers having declared a read for.
+///
+/// Only discovery is capped: past the last slot a frame is declared again, which
+/// costs accounting in the core but is never wrong.
+const DECLARED_READ_SLOTS: usize = 8;
 
 /// One recording of an [`ExecPool`], claimed by one thread.
 ///
@@ -906,6 +1356,12 @@ pub struct ExecContext<'pool> {
     /// Keeps the pool alive for as long as a recording is outstanding, and keeps
     /// the context off other threads.
     _pool: PhantomData<&'pool ExecPool>,
+    /// The frames this recording has already declared a read for.
+    ///
+    /// A frame is declared once: the core takes a reference and meters its bytes
+    /// on every call, and the waits it contributes are the same each time, so
+    /// declaring it per plane would only count it per plane.
+    declared: [*const ffi::VSFrame; DECLARED_READ_SLOTS],
 }
 
 impl ExecContext<'_> {
@@ -926,6 +1382,213 @@ impl ExecContext<'_> {
     #[must_use]
     pub fn as_ptr(&self) -> *mut ffi::VSGPUExecContext {
         self.handle.as_ptr()
+    }
+
+    /// Declares that this submission reads `frame`.
+    ///
+    /// Every plane's producer pair becomes a device side wait, and the frame is
+    /// kept alive until the submission completes. Declaring the same frame again
+    /// in one recording is allowed and settles nothing twice, which is what lets
+    /// [`ExecContext::read_plane()`] be called once per plane.
+    ///
+    /// A plane a foreign API holds is refused by the core rather than recorded,
+    /// so this is not a memory error to make: the core owns the check.
+    pub fn read(&mut self, frame: &VideoFrame) {
+        let ptr = frame.as_ptr().cast_const();
+        if self.declared.contains(&ptr) {
+            return;
+        }
+
+        if let Some(slot) = self.declared.iter_mut().find(|slot| slot.is_null()) {
+            *slot = ptr;
+        }
+
+        // SAFETY: the recording is live, the frame is borrowed for the call, and
+        // the context takes its own reference, so the frame's lifetime from here
+        // is the core's business.
+        unsafe { self.reads_frame(frame) };
+    }
+
+    /// Declares a read of `frame` and hands back the plane to bind.
+    ///
+    /// This is [`ExecContext::read()`] and the buffer a dispatch needs in one
+    /// call, which is what keeps a recording from binding a plane it never
+    /// declared.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VulkanError`] when the frame is not GPU resident or the plane
+    /// does not exist.
+    pub fn read_plane(
+        &mut self,
+        frame: &VideoFrame,
+        plane: i32,
+    ) -> Result<DispatchPlane, VulkanError> {
+        let Some(info) = frame.gpu_plane(plane) else {
+            return Err(VulkanError::new(
+                None,
+                "the frame is not GPU resident, or has no plane there",
+            ));
+        };
+        self.read(frame);
+
+        Ok(DispatchPlane { info })
+    }
+
+    /// Declares that this submission writes `plane` and hands it back to bind.
+    ///
+    /// Submitting publishes the pool's `(timeline, value)` on the plane as its
+    /// producer pair, which is how every later consumer knows when it is ready
+    /// without waiting for anything.
+    ///
+    /// A plane the frame shares with another frame is refused by the core rather
+    /// than written: a GPU plane has no copy on write, so the write would land in
+    /// both.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VulkanError`] when the frame is not GPU resident or the plane
+    /// does not exist.
+    pub fn write_plane(
+        &mut self,
+        frame: &mut VideoFrame,
+        plane: i32,
+    ) -> Result<DispatchPlane, VulkanError> {
+        let Some(info) = frame.gpu_plane(plane) else {
+            return Err(VulkanError::new(
+                None,
+                "the frame is not GPU resident, or has no plane there",
+            ));
+        };
+
+        // SAFETY: the recording is live, the frame is borrowed mutably for the
+        // call, and the plane is the caller's to declare.
+        unsafe { self.writes_plane(frame, plane) };
+
+        Ok(DispatchPlane { info })
+    }
+
+    /// Records one compute dispatch into the recording.
+    ///
+    /// `buffers` are bound to the pipeline's bindings in order, and there have to
+    /// be exactly as many as the pipeline declared: a shader reading a binding
+    /// nothing was written to reads whatever the driver left there, so a short
+    /// list is refused instead of recorded.
+    ///
+    /// `push_constants` is the block at offset zero and must fit the layout.
+    /// `groups` is the workgroup count, so the invocations are that times the
+    /// shader's `local_size`. Nothing waits for the dispatch here: the
+    /// submission's timeline value is what says when it has run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VulkanError`] when the buffer count or the push constant block
+    /// does not match the pipeline, or when the core did not resolve an entry
+    /// point this needs.
+    pub fn dispatch(
+        &mut self,
+        pipeline: &ComputePipeline,
+        buffers: &[DispatchPlane],
+        push_constants: &[u8],
+        groups: [u32; 3],
+    ) -> Result<(), VulkanError> {
+        if u32::try_from(buffers.len()).unwrap_or(u32::MAX) != pipeline.bindings {
+            return Err(VulkanError::new(
+                None,
+                "the dispatch binds a different number of buffers than the pipeline declares",
+            ));
+        }
+        let size = u32::try_from(push_constants.len()).unwrap_or(u32::MAX);
+        if size % 4 != 0 {
+            return Err(VulkanError::new(
+                None,
+                "the push constants are not a whole number of 32 bit values",
+            ));
+        }
+        if size > pipeline.push_constant_size {
+            return Err(VulkanError::new(
+                None,
+                "the push constants do not fit the pipeline layout",
+            ));
+        }
+
+        let (bind, push_descriptors, push_constants_call, dispatch_call) = (
+            pipeline.vk.vkCmdBindPipeline.ok_or_else(|| {
+                VulkanError::new(None, "the core did not resolve vkCmdBindPipeline")
+            })?,
+            pipeline.vk.vkCmdPushDescriptorSet.ok_or_else(|| {
+                VulkanError::new(None, "the core did not resolve vkCmdPushDescriptorSet")
+            })?,
+            pipeline.vk.vkCmdPushConstants2.ok_or_else(|| {
+                VulkanError::new(None, "the core did not resolve vkCmdPushConstants2")
+            })?,
+            pipeline
+                .vk
+                .vkCmdDispatch
+                .ok_or_else(|| VulkanError::new(None, "the core did not resolve vkCmdDispatch"))?,
+        );
+
+        let infos: Vec<ffi::VkDescriptorBufferInfo> = buffers
+            .iter()
+            .map(|plane| ffi::VkDescriptorBufferInfo {
+                buffer: plane.info.buffer,
+                offset: 0,
+                range: plane.info.buffer_size,
+            })
+            .collect();
+        let writes: Vec<ffi::VkWriteDescriptorSet> = infos
+            .iter()
+            .enumerate()
+            .map(|(binding, info)| ffi::VkWriteDescriptorSet {
+                sType: ffi::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                pNext: null(),
+                // Push descriptors have no set to write into; the field is
+                // ignored, and the binding lands on the layout's set 0.
+                dstSet: 0,
+                dstBinding: u32::try_from(binding).unwrap_or(0),
+                dstArrayElement: 0,
+                descriptorCount: 1,
+                descriptorType: ffi::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                pImageInfo: null(),
+                pBufferInfo: info,
+                pTexelBufferView: null(),
+            })
+            .collect();
+        let constants = ffi::VkPushConstantsInfo {
+            sType: ffi::VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO,
+            pNext: null(),
+            layout: pipeline.layout,
+            stageFlags: ffi::VK_SHADER_STAGE_COMPUTE_BIT,
+            offset: 0,
+            size: u32::try_from(push_constants.len()).unwrap_or(0),
+            pValues: push_constants.as_ptr().cast(),
+        };
+        let cb = self.command_buffer();
+
+        // SAFETY: the recording is live and is the only one this thread holds.
+        // Every buffer bound here was handed out by `read_plane` or `write_plane`
+        // and so was declared on this recording, which is what keeps the frames
+        // behind them alive until the submission completes. The push constant
+        // bytes and the descriptor infos are only read during the call.
+        unsafe {
+            bind(cb, ffi::VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
+            if !push_constants.is_empty() {
+                push_constants_call(cb, &raw const constants);
+            }
+            if !writes.is_empty() {
+                push_descriptors(
+                    cb,
+                    ffi::VK_PIPELINE_BIND_POINT_COMPUTE,
+                    pipeline.layout,
+                    0,
+                    u32::try_from(writes.len()).unwrap_or(0),
+                    writes.as_ptr(),
+                );
+            }
+            dispatch_call(cb, groups[0], groups[1], groups[2]);
+        }
+
+        Ok(())
     }
 
     /// Declares that this submission reads the frame.
@@ -1612,6 +2275,22 @@ mod tests {
         void main() {}\n"
     );
 
+    /// The kernel the pipeline test builds from: the two storage buffers and the
+    /// push constant a dispatch binds, written to be a copy so that the one path
+    /// through it is the whole path a filter takes.
+    const COPY_KERNEL: &CStr = cstr!(
+        "#version 460\n\
+        layout(local_size_x = 64) in;\n\
+        layout(std430, set = 0, binding = 0) readonly buffer Src { uint words[]; } src;\n\
+        layout(std430, set = 0, binding = 1) writeonly buffer Dst { uint words[]; } dst;\n\
+        layout(push_constant) uniform Params { uint words; } p;\n\
+        void main() {\n\
+            uint i = gl_GlobalInvocationID.x;\n\
+            if (i >= p.words) { return; }\n\
+            dst.words[i] = src.words[i];\n\
+        }\n"
+    );
+
     /// A core pinned to a usable GPU device, or [`None`] on a machine with no
     /// Vulkan device at all. The tests that need one skip rather than fail,
     /// since only the enumeration below is meaningful without a device.
@@ -1755,6 +2434,67 @@ mod tests {
             unsafe { pool.wait_idle() }?,
             ffi::VSGPUDrainResult::DeviceLost
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn compute_pipeline_and_recording() -> TestResult {
+        let Some(core) = gpu_core() else {
+            return Ok(());
+        };
+
+        let format = core.query_video_format(
+            ffi::VSColorFamily::Gray,
+            ffi::VSSampleType::Integer,
+            8,
+            0,
+            0,
+        );
+        let src = core
+            .new_gpu_video_frame(&format, 256, 256, None)
+            .expect("the core was pinned to a GPU device");
+        let mut dst = core
+            .new_gpu_video_frame(&format, 256, 256, None)
+            .expect("the core was pinned to a GPU device");
+
+        let shader = core.compile_gpu_shader(ffi::VSGPUShaderLanguage::GLSL, COPY_KERNEL)?;
+        let bytes = u32::try_from(size_of::<u32>())?;
+        let pipeline = ComputePipeline::builder(&core, &shader)
+            .storage_buffer()
+            .storage_buffer()
+            .push_constants(bytes)
+            .build()?;
+        assert_eq!(pipeline.bindings(), 2);
+        assert_ne!(pipeline.as_ptr(), 0);
+
+        let pool = core.create_gpu_exec_pool(ffi::VSVulkanQueueType::Compute)?;
+        let value = pool.record(|exec| {
+            let src_plane = exec.read_plane(&src, 0)?;
+            let dst_plane = exec.write_plane(&mut dst, 0)?;
+            let bytes = src_plane.size().min(dst_plane.size()) / 4;
+            let words = u32::try_from(bytes).expect("the planes are 256 by 256");
+
+            exec.dispatch(
+                &pipeline,
+                &[src_plane, dst_plane],
+                &words.to_ne_bytes(),
+                [words.div_ceil(64), 1, 1],
+            )
+        })?;
+        assert_ne!(value, 0);
+
+        // A second recording on a thread that still holds one is the case
+        // `acquire` is `unsafe` for, and the closure scoped call refuses it
+        // instead of letting the core find it fatal.
+        pool.record(|_| {
+            assert!(pool.record(|_| Ok(())).is_err());
+            Ok(())
+        })?;
+
+        // The write was declared, so the pool's value is the plane's producer
+        // pair and waiting for the frame is waiting for the dispatch.
+        dst.wait_gpu_frame()?;
 
         Ok(())
     }

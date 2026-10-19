@@ -48,32 +48,38 @@ Enabling `vs-vulkan` adds the [`vulkan`][8] module, the safe wrapper over
 `VSVulkan4.h`. It is opt-in rather than part of the default set, so nothing
 changes for a filter that only ever produces CPU frames.
 
-The module covers what the library can check and leaves the rest `unsafe`,
-because most of those calls are fatal when misused and none can be checked
-against device state:
+The module covers what the library can check, and leaves the rest `unsafe` where
+nothing but the caller knows the answer:
 
 - Owned handles — `Timeline`, `Shader`, `GpuBuffer`, `GpuMemory`,
   `GpuMemoryReservation` and `ExecPool` — that give their resource back when
-  dropped.
+  dropped, and a [`ComputePipeline`][9] that builds the shader module, both
+  layouts and the pipeline from a compiled shader.
 - Device and core information as owned data, through
   `VsVulkanApi::enumerate_devices()` and `Core::vulkan_core_info()`; GPU frames
   through `Core::new_gpu_video_frame()`, and their planes and residency through
   `VideoFrame::gpu_plane()` and `VideoFrame::residency()`.
-- Everything that records or publishes GPU work stays `unsafe`: locking a
-  queue, acquiring and submitting an exec context, publishing a plane's
-  producer pair, and taking an input frame with
-  `VideoNode::get_exportable_frame_filter()`.
+- A whole recording, through `ExecPool::record()`: it claims the context for the
+  calling thread, so the one context per thread rule that makes `acquire`
+  `unsafe` is checked rather than documented. Inside it, `read_plane()` and
+  `write_plane()` hand back the plane to bind and declaring it on the recording
+  is part of handing it back, so a submission cannot bind a buffer it never
+  declared, and `dispatch()` records it.
+- What is left `unsafe` is what only a caller can vouch for: locking a queue,
+  acquiring a context by hand and submitting it, handing over a buffer or a
+  memory region, publishing a plane's producer pair, and taking an input frame
+  with `VideoNode::get_exportable_frame_filter()`.
 
 A GPU filter declares itself once: the `gpu` modifier on its return type, as in
 `clip:vnode:gpu`. The `VSFilterFlags::GPUOutput` the core also wants is read
 from that declaration, so the node and the type cannot disagree. The example in
-`sample-plugin` —
-`src/gpu_invert.rs`, run by `test_gpu.vpy` — does the whole thing: a shader
-compiled once, an exec pool owned for the filter's lifetime, one dispatch per
-plane recorded into a single submission, and a result compared byte for byte
-against the CPU inverse of the same clip.
+`sample-plugin` — `src/gpu_invert.rs`, run by `test_gpu.vpy` — does the whole
+thing with no `unsafe` in it at all: a shader compiled once, a pipeline built
+from it, one dispatch per plane recorded into a single submission, and a result
+compared byte for byte against the CPU inverse of the same clip.
 
 [8]: https://docs.rs/vapoursynth4-rs/latest/vapoursynth4_rs/vulkan/
+[9]: https://docs.rs/vapoursynth4-rs/latest/vapoursynth4_rs/vulkan/struct.ComputePipeline.html
 
 ## Building
 
