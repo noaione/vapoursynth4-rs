@@ -124,6 +124,24 @@ impl Core {
     ) {
         debug_assert!(!out.as_ptr().is_null());
         unsafe {
+            // `createVideoFilterEx` is `createVideoFilter` with the filter flags
+            // appended; with `vs-43` compiled in, the flags are always passed so
+            // that a GPU filter can declare what it produces.
+            #[cfg(feature = "vs-43")]
+            (self.api.createVideoFilterEx)(
+                out.as_ptr(),
+                name.as_ptr(),
+                info,
+                F::filter_get_frame,
+                Some(F::filter_free),
+                F::FILTER_MODE,
+                F::FILTER_FLAGS,
+                dependencies.as_ptr(),
+                dependencies.len().try_into().unwrap(),
+                Box::into_raw(filter).cast(),
+                self.as_ptr(),
+            );
+            #[cfg(not(feature = "vs-43"))]
             (self.api.createVideoFilter)(
                 out.as_ptr(),
                 name.as_ptr(),

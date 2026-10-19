@@ -10,7 +10,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 vapoursynth4-rs = { version = "0.5.1", path = "../vapoursynth4-rs", features = [
+  "link-vs",       # for the GPU device probe in tests
   "link-vsscript", # for tests
+  "vs-vulkan",     # for the GPU filter example
 ] }
 
 

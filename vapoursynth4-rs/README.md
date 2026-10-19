@@ -64,8 +64,13 @@ against device state:
   producer pair, and taking an input frame with
   `VideoNode::get_exportable_frame_filter()`.
 
-Declaring a filter's output GPU resident (`VSFilterFlags::GPUOutput`) is not
-part of the safe registration API yet; use the raw bindings for that.
+A GPU filter declares itself in two places, and the core checks them against
+each other: `Filter::FILTER_FLAGS` sets `VSFilterFlags::GPUOutput`, and the
+return type says `clip:vnode:gpu`. The example in `sample-plugin` —
+`src/gpu_invert.rs`, run by `test_gpu.vpy` — does the whole thing: a shader
+compiled once, an exec pool owned for the filter's lifetime, one dispatch per
+plane recorded into a single submission, and a result compared byte for byte
+against the CPU inverse of the same clip.
 
 [8]: https://docs.rs/vapoursynth4-rs/latest/vapoursynth4_rs/vulkan/
 

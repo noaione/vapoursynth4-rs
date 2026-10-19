@@ -16,6 +16,15 @@ where
     Self: Sized + std::panic::RefUnwindSafe,
 {
     const FILTER_MODE: FilterMode = FilterMode::Parallel;
+
+    /// What the filter produces, as [`ffi::VSFilterFlags`].
+    ///
+    /// A GPU filter sets [`ffi::VSFilterFlags::GPUOutput`] here *and* declares a
+    /// `gpu` return type such as `clip:vnode:gpu`; the core checks the two
+    /// against each other and refuses a node that only says one of them.
+    #[cfg(feature = "vs-43")]
+    const FILTER_FLAGS: i32 = 0;
+
     /// Filter error that can turned into a [`&CStr`](std::ffi::CStr)
     type Error: AsRef<CStr>;
     type FrameType: Frame;

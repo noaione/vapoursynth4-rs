@@ -120,16 +120,59 @@ impl Script {
     ///
     /// Returns a `ScriptError` if the output node could not be retrieved.
     pub fn get_output(&self, index: c_int) -> Result<OutputNode, ScriptError> {
+        // SAFETY: the handle is live, and the node that comes back is owned by
+        // this call.
         unsafe {
             let ptr =
                 self.get_ptr_error((self.vssapi.getOutputNode)(self.handle.as_ptr(), index))?;
-            match (self.api.getNodeType)(ptr) {
-                ffi::VSMediaType::Audio => {
-                    Ok(OutputNode::Audio(AudioNode::from_ptr(ptr, self.api)))
-                }
-                ffi::VSMediaType::Video => {
-                    Ok(OutputNode::Video(VideoNode::from_ptr(ptr, self.api)))
-                }
+            Ok(self.output_node(ptr))
+        }
+    }
+
+    /// Gets the output node at the specified index, with [`ffi::VSScriptGetFlags`]
+    /// describing how it is handed over.
+    ///
+    /// The plain [`Script::get_output()`] is this without flags, which means a GPU
+    /// resident clip is downloaded first: that is the one the host can read.
+    /// With [`ffi::VSScriptGetFlags::AllowGPUResident`] the clip keeps the
+    /// residency the script gave it, which is what a caller handing it to
+    /// another GPU consumer wants.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ScriptError` if the output node could not be retrieved.
+    #[cfg(feature = "vsscript-44")]
+    pub fn get_output_with_flags(
+        &self,
+        index: c_int,
+        flags: c_int,
+    ) -> Result<OutputNode, ScriptError> {
+        // SAFETY: the handle is live, and the node that comes back is owned by
+        // this call.
+        unsafe {
+            let ptr = self.get_ptr_error((self.vssapi.getOutputNodeEx)(
+                self.handle.as_ptr(),
+                index,
+                flags,
+            ))?;
+            Ok(self.output_node(ptr))
+        }
+    }
+
+    /// Wraps a node a `getOutputNode*` call handed over.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be a live node this call may take ownership of.
+    unsafe fn output_node(&self, ptr: *mut ffi::VSNode) -> OutputNode {
+        // SAFETY: the caller vouched for the pointer, and the node it points at
+        // is what decides which wrapper it gets.
+        match unsafe { (self.api.getNodeType)(ptr) } {
+            ffi::VSMediaType::Audio => {
+                OutputNode::Audio(unsafe { AudioNode::from_ptr(ptr, self.api) })
+            }
+            ffi::VSMediaType::Video => {
+                OutputNode::Video(unsafe { VideoNode::from_ptr(ptr, self.api) })
             }
         }
     }

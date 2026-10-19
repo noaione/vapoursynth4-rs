@@ -488,6 +488,11 @@ pub struct Shader {
 // SAFETY: the shader holds the compiled words and nothing device specific, and
 // is reference counted inside the core's cache.
 unsafe impl Send for Shader {}
+// SAFETY: a compiled shader is immutable once returned -- the only thing a
+// `&Shader` reaches is [`Shader::code()`], which reads the cached words -- so
+// sharing one with the worker threads of a filter is safe. A parallel GPU
+// filter holds one in its instance for exactly that.
+unsafe impl Sync for Shader {}
 
 impl Shader {
     /// The SPIR-V words.

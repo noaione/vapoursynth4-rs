@@ -31,6 +31,17 @@ pub trait Node: Sized + Send + Sync + crate::_private::Sealed {
     #[must_use]
     fn as_ptr(&self) -> *mut ffi::VSNode;
 
+    /// Whether this node is host resident or GPU resident.
+    ///
+    /// A node reports [`ffi::VSNodeResidency::GPU`] when its filter was created
+    /// with [`ffi::VSFilterFlags::GPUOutput`].
+    #[cfg(feature = "vs-43")]
+    #[must_use]
+    fn residency(&self) -> ffi::VSNodeResidency {
+        // SAFETY: the node is live for the duration of the call.
+        unsafe { (self.api().getNodeResidency)(self.as_ptr()) }
+    }
+
     #[must_use]
     fn get_frame_filter(&self, n: i32, ctx: &mut FrameContext) -> Self::FrameType;
 
@@ -198,7 +209,23 @@ impl VideoNode {
         let name = CString::new(name).ok()?;
         let core = core.as_ref();
         let ptr = unsafe {
-            (core.api().createVideoFilter2)(
+            // As in [`Core::create_video_filter()`](crate::core::Core::create_video_filter):
+            // the `Ex2` entry point is `createVideoFilter2` plus the filter flags.
+            #[cfg(feature = "vs-43")]
+            let ptr = (core.api().createVideoFilterEx2)(
+                name.as_ptr(),
+                info,
+                F::filter_get_frame,
+                Some(F::filter_free),
+                F::FILTER_MODE,
+                F::FILTER_FLAGS,
+                dependencies.as_ptr(),
+                dependencies.len().try_into().unwrap(),
+                Box::into_raw(filter).cast(),
+                core.as_ptr(),
+            );
+            #[cfg(not(feature = "vs-43"))]
+            let ptr = (core.api().createVideoFilter2)(
                 name.as_ptr(),
                 info,
                 F::filter_get_frame,
@@ -208,7 +235,9 @@ impl VideoNode {
                 dependencies.len().try_into().unwrap(),
                 Box::into_raw(filter).cast(),
                 core.as_ptr(),
-            )
+            );
+
+            ptr
         };
         ptr.is_null()
             .then_some(unsafe { Self::from_ptr(ptr, core.api()) })
