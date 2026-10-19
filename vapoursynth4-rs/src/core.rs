@@ -135,7 +135,7 @@ impl Core {
                 F::filter_get_frame,
                 Some(F::filter_free),
                 F::FILTER_MODE,
-                F::FILTER_FLAGS,
+                crate::node::filter_flags::<F>(),
                 dependencies.as_ptr(),
                 dependencies.len().try_into().unwrap(),
                 Box::into_raw(filter).cast(),

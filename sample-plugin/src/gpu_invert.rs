@@ -355,13 +355,12 @@ impl Filter for InvertGpuFilter {
     type FrameType = VideoFrame;
     type FilterData = ();
 
-    /// Ties the two halves of the GPU declaration together: the core refuses a
-    /// node that is called `:gpu` but not created with
-    /// [`ffi::VSFilterFlags::GPUOutput`], and the other way round.
-    const FILTER_FLAGS: i32 = ffi::VSFilterFlags::GPUOutput as i32;
-
     const NAME: &'static CStr = c"InvertGPU";
     const ARGS: &'static CStr = c"clip:vnode:gpu;";
+    /// `clip:vnode:gpu` is the whole GPU declaration. The modifier is what
+    /// makes the core hand the filter a device, and it is also what makes the
+    /// framework create the node with [`ffi::VSFilterFlags::GPUOutput`]; the
+    /// two can never disagree because only one of them is written down.
     const RETURN_TYPE: &'static CStr = c"clip:vnode:gpu;";
 
     fn create(
